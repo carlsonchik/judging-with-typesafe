@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 """Скан текста по абзацам через TypeSafe Jev.
 
-Задаёт каждому абзацу ОДИН вопрос и возвращает карту: где аргумент есть,
-где фрагмент другого типа (перечисление, признание открытости, список).
+Три режима:
+  verify  — «можно ли проверить утверждение, не обращаясь к автору?» (основной)
+  rubric  — рубрика из четырёх вопросов, решение принимается по сводке
+  claim   — «содержит ли фрагмент утверждение, требующее проверки?»
 
-Важно: низкий балл НЕ значит «плохой абзац». Он значит, что этот абзац
-не является утверждением с основаниями — например, это список или постановка вопроса.
-Такой абзац надо оценивать другим вопросом, а не понижать в качестве.
+Ключевые правила (проверены на живом API):
+  * Значения 0.30–0.70 — это «не знаю», а не «средне». Они идут в колонку «нужен человек».
+  * Низкий балл не значит «плохой текст»: он значит «не тот тип фрагмента».
+  * Для философской прозы различение слабое — вопрос про проверяемость там шумит.
 
 Использование:
-    python3 scan_text.py <файл.md> [--mode argument|claim|source] [--min-len 300]
-Режимы (что именно меряем в каждом абзаце):
-    argument — есть ли утверждение с приведёнными основаниями (по умолчанию)
-    claim    — заявлено ли нечто, требующее проверки
-    source   — указан ли проверяемый источник
+    python3 scan_text.py файл.md --mode verify --min-len 400
+    python3 scan_text.py файл.md --mode rubric
 """
-import argparse, json, re, statistics, subprocess, sys, os
+import argparse, json, os, re, statistics, subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WRAP = os.path.join(HERE, "typesafe.py")
 
-QUESTIONS = {
-    "argument": "В этом фрагменте есть утверждение, для которого приведены основания?",
-    "claim": "Этот фрагмент содержит утверждение, которое требует проверки?",
-    "source": "В этом фрагменте указан проверяемый источник утверждения?",
+RUBRIC = {
+    "objects": "Фрагмент называет конкретные объекты и операции или только описывает значимость темы?",
+    "verifiable": "Можно ли проверить утверждение фрагмента, не обращаясь к автору?",
+    "substance": "Если убрать оценочные слова, останется ли в фрагменте проверяемое содержание?",
+    "definite": "Фрагмент сообщает что-то определённое или создаёт впечатление глубины?",
 }
+VERIFY_Q = RUBRIC["verifiable"]
+CLAIM_Q = "Содержит ли фрагмент утверждение, которое требует проверки?"
+UNCERTAIN = (0.30, 0.70)
 
 
-def judge(state: str, question: str):
+def judge(state, question):
     out = subprocess.run(["python3", WRAP, "noul", state, question],
                          capture_output=True, text=True).stdout.strip()
     try:
@@ -36,51 +40,71 @@ def judge(state: str, question: str):
         return None
 
 
-def blocks_of(text: str, min_len: int):
+def blocks(text, min_len):
     out = []
     for i, b in enumerate(re.split(r'\n\s*\n', text)):
-        plain = re.sub(r'^#+\s*', '', b).strip()
-        plain = re.sub(r'^\*\*[^*]+\*\*\s*', '', plain).strip()   # снять ведущий жирный заголовок
-        if len(plain) < min_len:
+        p = re.sub(r'^#+\s*', '', b).strip()
+        p = re.sub(r'^\*\*[^*]+\*\*\s*', '', p).strip()
+        if len(p) < min_len or p.startswith(("**Ключевые", "**Keywords", "---", "|")):
             continue
-        if plain.startswith(("**Ключевые", "**Keywords", "---", "|")):
-            continue
-        out.append((i, plain))
+        out.append((i, p))
     return out
+
+
+def verdict(v):
+    if v is None:
+        return "нет ответа", "bad"
+    if v > UNCERTAIN[1]:
+        return "проверяемо / есть содержание", "ok"
+    if v < UNCERTAIN[0]:
+        return "не проверяемо / общие слова", "low"
+    return "НЕ ЯСНО — нужен человек", "uncertain"
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("path")
-    p.add_argument("--mode", choices=list(QUESTIONS), default="argument")
-    p.add_argument("--min-len", type=int, default=300)
+    p.add_argument("--mode", choices=["verify", "rubric", "claim"], default="verify")
+    p.add_argument("--min-len", type=int, default=400)
     p.add_argument("--out", default=None)
     a = p.parse_args()
 
-    question = QUESTIONS[a.mode]
     text = open(a.path, encoding="utf-8").read()
     rows = []
     print(f"файл: {a.path}")
-    print(f"режим: {a.mode} — «{question}»")
-    print(f"абзацев длиннее {a.min_len} символов\n")
-    for i, plain in blocks_of(text, a.min_len):
-        v = judge(plain, question)
-        head = re.sub(r'\s+', ' ', plain)[:68]
-        if v is None:
-            mark = "нет ответа"
-        elif v < 0.35:
-            mark = "не утверждение (список/постановка)"
-        elif v < 0.55:
-            mark = "близко к порогу"
+    print(f"режим: {a.mode} | пороги: <{UNCERTAIN[0]} не проверяемо, "
+          f"{UNCERTAIN[0]}–{UNCERTAIN[1]} нужен человек, >{UNCERTAIN[1]} проверяемо\n")
+
+    for i, plain in blocks(text, a.min_len):
+        rec = {"block": i, "start": re.sub(r'\s+', ' ', plain)[:68], "text": plain}
+        if a.mode == "rubric":
+            vals = {k: judge(plain, q) for k, q in RUBRIC.items()}
+            rec["scores"] = vals
+            good = [v for v in vals.values() if v is not None]
+            mean = round(statistics.mean(good), 3) if good else None
+            rec["mean"] = mean
+            un = sum(1 for v in good if UNCERTAIN[0] <= v <= UNCERTAIN[1])
+            mark, _ = verdict(mean)
+            if un >= 2:
+                mark = "НЕ ЯСНО по рубрике — нужен человек"
+            brief = " ".join(f"{k}={v}" for k, v in vals.items())
+            print(f"  {str(mean):>5}  {mark:<34} {rec['start']}\n         {brief}")
         else:
-            mark = "утверждение с основаниями"
-        print(f"  {v if v is not None else '—':>5}  {mark:<32} {head}")
-        rows.append({"block": i, "verdict": v, "kind": mark, "start": head, "text": plain})
-    vals = [r["verdict"] for r in rows if r["verdict"] is not None]
+            q = VERIFY_Q if a.mode == "verify" else CLAIM_Q
+            v = judge(plain, q)
+            rec["verdict"] = v
+            mark, _ = verdict(v)
+            print(f"  {str(v):>5}  {mark:<34} {rec['start']}")
+        rows.append(rec)
+
+    vals = [r.get("verdict") if a.mode != "rubric" else r.get("mean") for r in rows]
+    vals = [v for v in vals if v is not None]
     if vals:
-        print(f"\nабзацев: {len(vals)} | среднее {statistics.mean(vals):.3f} "
-              f"| утверждений с основаниями: {sum(1 for v in vals if v >= 0.55)} "
-              f"| не-утверждений: {sum(1 for v in vals if v < 0.35)}")
+        un = sum(1 for v in vals if UNCERTAIN[0] <= v <= UNCERTAIN[1])
+        print(f"\nабзацев: {len(vals)} | среднее {statistics.mean(vals):.3f}"
+              f" | определённых: {sum(1 for v in vals if v > UNCERTAIN[1])}"
+              f" | неясных (нужен человек): {un}"
+              f" | явно слабых: {sum(1 for v in vals if v < UNCERTAIN[0])}")
     out = a.out or os.path.splitext(a.path)[0] + f"-скан-{a.mode}.json"
     json.dump(rows, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"результат: {out}")
